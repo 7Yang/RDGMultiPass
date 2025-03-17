@@ -58,7 +58,7 @@ namespace MultiPassExample
 	class FRectangleVertexBuffer : public FVertexBuffer
 	{
 	public:
-		void InitRHI() override
+		void InitRHI(FRHICommandListBase& RHICmdList) override
 		{
 			TResourceArray<FTextureVertex, VERTEXBUFFER_ALIGNMENT> Vertices;
 			Vertices.SetNumUninitialized(6);
@@ -89,7 +89,7 @@ namespace MultiPassExample
 	class FRectangleIndexBuffer : public FIndexBuffer
 	{
 	public:
-		void InitRHI() override
+		void InitRHI(FRHICommandListBase& RHICmdList) override
 		{
 			const uint16 Indices[] = {0, 1, 2, 2, 1, 3, 0, 4, 5};
 			const uint32 NumIndices = UE_ARRAY_COUNT(Indices);
@@ -108,7 +108,7 @@ namespace MultiPassExample
 	public:
 		FVertexDeclarationRHIRef VertexDeclarationRHI;
 
-		virtual void InitRHI() override
+		virtual void InitRHI(FRHICommandListBase& RHICmdList) override
 		{
 			FVertexDeclarationElementList Elements;
 			uint32 Stride = sizeof(FTextureVertex);
