@@ -11,6 +11,12 @@
 
 namespace MultiPassExample
 {
+    struct FGPUOutput
+    {
+        float Data1[4];
+        float Data2[4];
+    };
+
 	TGlobalResource<FTextureVertexDeclaration> GTextureVertexDeclaration;
 	TGlobalResource<FRectangleVertexBuffer>    GRectangleVertexBuffer;
 	TGlobalResource<FRectangleIndexBuffer>     GRectangleIndexBuffer;
@@ -23,13 +29,14 @@ namespace MultiPassExample
 		SHADER_USE_PARAMETER_STRUCT(FSimpleRDGComputeShader, FGlobalShader);
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		    SHADER_PARAMETER_STRUCT_REF(FSimpleUniformStructParameters, SimpleUniformStruct)
+		    SHADER_PARAMETER_STRUCT_REF(FSimpleUniformStructParameters, UniformStructParameters)
+            SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FGPUOutput>, GPUOutput)
 		    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutTexture)
 		END_SHADER_PARAMETER_STRUCT()
 
 		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters &Parameters)
 		{
-			return RHISupportsComputeShaders(Parameters.Platform);
+            return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
 		}
 	};
 
@@ -72,7 +79,7 @@ namespace MultiPassExample
 		FSimpleRDGPixelShader(const ShaderMetaType::CompiledShaderInitializerType &Initializer) : FSimpleRDGGlobalShader(Initializer) {}
 	};
 
-	IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT(FSimpleUniformStructParameters, "SimpleUniform");
+	IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT(FSimpleUniformStructParameters, "UniformStructParameters");
 	IMPLEMENT_GLOBAL_SHADER(FSimpleRDGComputeShader, "/MultiPass/Private/SimpleComputeShader.usf", "MainCS", SF_Compute);
 	IMPLEMENT_GLOBAL_SHADER(FSimpleRDGVertexShader,  "/MultiPass/Private/SimplePixelShader.usf",   "MainVS", SF_Vertex);
 	IMPLEMENT_GLOBAL_SHADER(FSimpleRDGPixelShader,   "/MultiPass/Private/SimplePixelShader.usf",   "MainPS", SF_Pixel);
@@ -84,36 +91,48 @@ namespace MultiPassExample
 		FRDGBuilder GraphBuilder(RHIImmCmdList);
 
 		// Pass1: 将计算着色器输出到纹理
-		const FRDGTextureDesc& ComputeRenderTargetDesc = FRDGTextureDesc::Create2D(OutRenderTargetRHI->GetSizeXY(), OutRenderTargetRHI->GetFormat(), FClearValueBinding::Black,
-			TexCreate_RenderTargetable | TexCreate_ShaderResource | TexCreate_UAV);
+		const FRDGTextureDesc& ComputeRenderTargetDesc = FRDGTextureDesc::Create2D(OutRenderTargetRHI->GetSizeXY(), OutRenderTargetRHI->GetFormat(), FClearValueBinding::Black, TexCreate_RenderTargetable | TexCreate_ShaderResource | TexCreate_UAV);
 		FRDGTextureRef RDGComputeRenderTarget  = GraphBuilder.CreateTexture(ComputeRenderTargetDesc, TEXT("ComputeRDGRenderTarget"));
 		FRDGTextureUAVRef OutComputeTextureRef = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(RDGComputeRenderTarget));
 
-		FSimpleUniformStructParameters StructParameters;
-		FSimpleRDGComputeShader::FParameters* ComputeShaderParameters = GraphBuilder.AllocParameters<FSimpleRDGComputeShader::FParameters>();
-		ComputeShaderParameters->SimpleUniformStruct = TUniformBufferRef<FSimpleUniformStructParameters>::CreateUniformBufferImmediate(StructParameters, UniformBuffer_SingleFrame);
-		ComputeShaderParameters->OutTexture          = OutComputeTextureRef;
+        int32 ArrayLength = (OutRenderTargetRHI->GetSizeX() / 32) * (OutRenderTargetRHI->GetSizeY() / 32);
+        FRDGBufferRef GPUOutputBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FGPUOutput), ArrayLength), TEXT("GPUOutput"));
 
+		FSimpleUniformStructParameters StructParameters;
+        StructParameters.Color1 = FLinearColor(1.f, 0.f, 0.f, 1.f);
+        StructParameters.Color2 = FLinearColor(0.f, 1.f, 0.f, 1.f);
+        StructParameters.Color3 = FLinearColor(1.f, 0.f, 1.f, 1.f);
+        StructParameters.Color4 = FLinearColor(1.f, 0.f, 0.f, 1.f);
+        StructParameters.ColorIndex = 1;
+
+		FSimpleRDGComputeShader::FParameters* ComputeShaderParameters = GraphBuilder.AllocParameters<FSimpleRDGComputeShader::FParameters>();
+		ComputeShaderParameters->UniformStructParameters = TUniformBufferRef<FSimpleUniformStructParameters>::CreateUniformBufferImmediate(StructParameters, UniformBuffer_SingleFrame);
+        ComputeShaderParameters->GPUOutput               = GraphBuilder.CreateUAV(GPUOutputBuffer);
+		ComputeShaderParameters->OutTexture              = OutComputeTextureRef;
+
+        FRDGBufferRef GPUDuplicatedBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FGPUOutput), ArrayLength), TEXT("DuplicatedBuffer"));
 		GraphBuilder.AddPass(RDG_EVENT_NAME("RDGComputeShader"), ComputeShaderParameters, ERDGPassFlags::Compute, [ComputeShaderParameters, OutRenderTargetRHI](FRHICommandList& RHICmdList)
 		{
 			TShaderMapRef<FSimpleRDGComputeShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 			FIntVector ThreadGroupCount(OutRenderTargetRHI->GetSizeX() / 32, OutRenderTargetRHI->GetSizeY() / 32, 1);
 			FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader, *ComputeShaderParameters, ThreadGroupCount);
-		});
+        });
+
+		TRefCountPtr<FRDGPooledBuffer> PooledBuffer;
+		GraphBuilder.QueueBufferExtraction(GPUOutputBuffer, &PooledBuffer, ERHIAccess::CPURead);
 
 		TRefCountPtr<IPooledRenderTarget> ComputePooledRenderTarget;
 		GraphBuilder.QueueTextureExtraction(RDGComputeRenderTarget, &ComputePooledRenderTarget);
 
 		// Pass2: 基础绘制，并使用计算着色器输出纹理为图片
-		const FRDGTextureDesc& RenderTargetDesc = FRDGTextureDesc::Create2D(OutRenderTargetRHI->GetSizeXY(), OutRenderTargetRHI->GetFormat(), FClearValueBinding::Black,
-			TexCreate_RenderTargetable | TexCreate_ShaderResource | TexCreate_UAV);
+		const FRDGTextureDesc& RenderTargetDesc = FRDGTextureDesc::Create2D(OutRenderTargetRHI->GetSizeXY(), OutRenderTargetRHI->GetFormat(), FClearValueBinding::Black, TexCreate_RenderTargetable | TexCreate_ShaderResource | TexCreate_UAV);
 		FRDGTextureRef RDGRenderTarget = GraphBuilder.CreateTexture(RenderTargetDesc, TEXT("RDGRenderTarget"));
 
 		FSimpleRDGPixelShader::FParameters* Parameters = GraphBuilder.AllocParameters<FSimpleRDGPixelShader::FParameters>();
-		Parameters->Texture          = RDGComputeRenderTarget;
-		Parameters->TextureSampler   = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-		Parameters->SimpleUniform    = TUniformBufferRef<FSimpleUniformStructParameters>::CreateUniformBufferImmediate(StructParameters, UniformBuffer_SingleFrame);
-		Parameters->RenderTargets[0] = FRenderTargetBinding(RDGRenderTarget, ERenderTargetLoadAction::ENoAction);
+		Parameters->Texture            = RDGComputeRenderTarget;
+		Parameters->TextureSampler     = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		Parameters->SimpleUniform      = TUniformBufferRef<FSimpleUniformStructParameters>::CreateUniformBufferImmediate(StructParameters, UniformBuffer_SingleFrame);
+		Parameters->RenderTargets[0]   = FRenderTargetBinding(RDGRenderTarget, ERenderTargetLoadAction::ENoAction);
 
 		GraphBuilder.AddPass(RDG_EVENT_NAME("RDGSimpleDraw"), Parameters, ERDGPassFlags::Raster, [Parameters, ComputeShaderParameters](FRHICommandList& RHICmdList)
 		{
@@ -147,7 +166,15 @@ namespace MultiPassExample
 		GraphBuilder.QueueTextureExtraction(RDGRenderTarget, &PooledRenderTarget);
 
 		GraphBuilder.Execute();
-		RHIImmCmdList.CopyTexture(PooledRenderTarget->GetRenderTargetItem().ShaderResourceTexture, OutRenderTargetRHI->GetTexture2D(), FRHICopyTextureInfo());
+
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // 必须调用GraphBuilder.QueueBufferExtraction()函数且在GraphBuilder.Execute()之后才能访问PooledBuffer!
+        FGPUOutput Data;
+        void* GPUOutputPtr = static_cast<FGPUOutput*>(RHILockBuffer(PooledBuffer->GetRHI(), 0, PooledBuffer->GetSize(), EResourceLockMode::RLM_ReadOnly));
+        FMemory::Memcpy(&Data, GPUOutputPtr, sizeof(FGPUOutput));
+        RHIUnlockBuffer(PooledBuffer->GetRHI());
+
+		RHIImmCmdList.CopyTexture(PooledRenderTarget->GetRHI(), OutRenderTargetRHI, FRHICopyTextureInfo());
 	}
 } 
 
